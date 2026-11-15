@@ -34,7 +34,7 @@ export default function Contact() {
       await submitContactForm(formData)
       setStatus({ state: 'success', message: 'Enquiry received. We will be in touch shortly.' })
       setFormData({ name: '', email: '', project: 'Residential', message: '' })
-    } catch (error) {
+    } catch {
       setStatus({ state: 'error', message: 'Failed to send enquiry. Please try again.' })
     }
   }
@@ -83,7 +83,7 @@ export default function Contact() {
             </p>
 
             <div className="flex flex-col gap-8">
-              {contactInfo.map((info, i) => (
+              {contactInfo.map((info) => (
                 <div key={info.label} className="flex items-start gap-6 group">
                   <div className="w-12 h-12 rounded-full border border-white/10 flex items-center justify-center text-accent group-hover:bg-accent group-hover:text-on-accent transition-all duration-300">
                     <span className="material-symbols-outlined">{info.icon}</span>

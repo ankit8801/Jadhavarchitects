@@ -105,7 +105,7 @@ export default function Services() {
           }}
           className="grid grid-cols-2 md:flex md:flex-row items-center justify-between gap-8 md:gap-4"
         >
-          {stats.map((stat, i) => (
+          {stats.map((stat) => (
             <motion.div
               key={stat.label}
               variants={{

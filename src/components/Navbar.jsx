@@ -22,6 +22,7 @@ function Navbar() {
   }, [])
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setMobileOpen(false)
     document.body.style.overflow = ''
   }, [location.pathname])
