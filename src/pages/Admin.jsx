@@ -1,16 +1,51 @@
 import React, { useState, useEffect } from 'react'
-import { motion } from 'framer-motion'
+import { motion, AnimatePresence } from 'framer-motion'
 import { Helmet } from 'react-helmet-async'
 import { loginAdmin, subscribeToAuthChanges, logoutAdmin } from '../firebase/services/authService'
 import { fetchProjects, deleteProject } from '../firebase/services/projectService'
 import { useNavigate } from 'react-router-dom'
-import { fetchContacts } from '../firebase/services/contactService'
+import { fetchContacts, updateContactStatus, deleteContact } from '../firebase/services/contactService'
 import { getSettings, updateSetting } from '../firebase/services/settingsService'
 import { uploadFile } from '../firebase/services/storageService'
 import { processImageForWeb } from '../utils/imageProcessor'
 import ProjectModal from '../components/ProjectModal'
 import ImageCropModal from '../components/ImageCropModal'
 import houseRender from '../assets/transparentbackgroundhouse.png'
+
+const PIPELINE_STAGES = ['Pending', 'Accepted', 'In Progress', 'Completed', 'Rejected'];
+
+const STATUS_CONFIG = {
+  'Pending': {
+    label: 'Pending',
+    badgeClass: 'bg-amber-500/10 text-amber-300 border-amber-500/30',
+    icon: 'hourglass_empty',
+    description: 'Awaiting architectural review'
+  },
+  'Accepted': {
+    label: 'Accepted',
+    badgeClass: 'bg-emerald-500/10 text-emerald-300 border-emerald-500/30',
+    icon: 'check_circle',
+    description: 'Project accepted'
+  },
+  'In Progress': {
+    label: 'In Progress',
+    badgeClass: 'bg-sky-500/10 text-sky-300 border-sky-500/30',
+    icon: 'construction',
+    description: 'Work in progress'
+  },
+  'Completed': {
+    label: 'Completed',
+    badgeClass: 'bg-purple-500/10 text-purple-300 border-purple-500/30',
+    icon: 'task_alt',
+    description: 'Project completed'
+  },
+  'Rejected': {
+    label: 'Rejected',
+    badgeClass: 'bg-rose-500/10 text-rose-300 border-rose-500/30',
+    icon: 'cancel',
+    description: 'Inquiry declined'
+  }
+};
 
 export default function Admin() {
   const [isLoggedIn, setIsLoggedIn] = useState(false)
@@ -27,8 +62,24 @@ export default function Admin() {
   const [isAuthChecking, setIsAuthChecking] = useState(true)
   const [cropImage, setCropImage] = useState(null)
   const [isCropModalOpen, setIsCropModalOpen] = useState(false)
+
+  // Inquiries & Tracker filters and modals
+  const [inquiryFilter, setInquiryFilter] = useState('All')
+  const [trackerFilter, setTrackerFilter] = useState('All')
+  const [searchQuery, setSearchQuery] = useState('')
+  const [selectedInquiryDetail, setSelectedInquiryDetail] = useState(null)
+  const [inquiryToDelete, setInquiryToDelete] = useState(null)
+  const [toast, setToast] = useState({ show: false, message: '', type: 'success' })
+
   const navigate = useNavigate()
   const customEase = [0.16, 1, 0.3, 1]
+
+  const showToast = (message, type = 'success') => {
+    setToast({ show: true, message, type })
+    setTimeout(() => {
+      setToast(prev => ({ ...prev, show: false }))
+    }, 4000)
+  }
 
   useEffect(() => {
     const loadInitialData = async () => {
@@ -52,7 +103,6 @@ export default function Admin() {
       if (user) {
         loadInitialData()
       } else {
-        // Defensive: Clear sensitive state on logout
         setProjects([])
         setContacts([])
         setSettings({})
@@ -69,7 +119,6 @@ export default function Admin() {
         await loginAdmin(email, password)
       }
     } catch (error) {
-      // Map error codes to user-friendly messages, but keep the code visible for diagnosis
       const errorMessage = error.code ? `${error.code}: ${error.message}` : 'Invalid credentials'
       setLoginError(errorMessage)
     }
@@ -78,7 +127,6 @@ export default function Admin() {
   const handleLogout = async () => {
     try {
       await logoutAdmin()
-      // Force navigation to home to clear the history stack and prevent back-button access
       navigate('/', { replace: true })
     } catch (error) {
       console.error(error)
@@ -101,8 +149,9 @@ export default function Admin() {
         await deleteProject(id)
         const data = await fetchProjects()
         setProjects(data)
+        showToast("Project successfully removed from archive", "success")
       } catch (err) {
-        window.alert("Failed to delete: " + err.message)
+        showToast("Failed to delete: " + err.message, "error")
       }
     }
   }
@@ -113,6 +162,44 @@ export default function Admin() {
     setIsModalOpen(true)
   }
 
+  // ==========================================
+  // INQUIRIES & TRACKER STATUS MANAGEMENT
+  // ==========================================
+
+  const handleStatusChange = async (contactId, newStatus) => {
+    const previousContacts = [...contacts]
+    // Optimistic UI update
+    setContacts(prev => prev.map(c => c.id === contactId ? { ...c, status: newStatus } : c))
+
+    try {
+      await updateContactStatus(contactId, newStatus)
+      showToast(`Status updated to "${newStatus}"`, 'success')
+    } catch (err) {
+      console.error("Error updating status:", err)
+      // Revert on error
+      setContacts(previousContacts)
+      showToast(`Failed to update status: ${err.message}`, 'error')
+    }
+  }
+
+  const confirmDeleteInquiry = async () => {
+    if (!inquiryToDelete) return
+    const id = inquiryToDelete.id
+    const previousContacts = [...contacts]
+    setContacts(prev => prev.filter(c => c.id !== id))
+    setInquiryToDelete(null)
+
+    try {
+      await deleteContact(id)
+      showToast("Inquiry successfully deleted", 'success')
+    } catch (err) {
+      console.error("Error deleting inquiry:", err)
+      setContacts(previousContacts)
+      showToast(`Failed to delete: ${err.message}`, 'error')
+    }
+  }
+
+  // Page Content Image updates
   const handleImageUpdate = (slot, e) => {
     const file = e.target.files[0]
     if (!file) return
@@ -127,47 +214,58 @@ export default function Admin() {
   }
 
   const handleCropSave = async (blob) => {
-    if (!uploadingSlot) return;
-    if (!blob) {
-      console.error("Upload aborted: No blob provided");
-      return;
-    }
+    if (!uploadingSlot) return
+    if (!blob) return
 
-    setIsCropModalOpen(false);
-    console.log(`--- Starting Page Content Upload: ${uploadingSlot} ---`);
+    setIsCropModalOpen(false)
 
     try {
       const watermarkOptions = settings?.watermarkEnabled 
-        ? { enabled: true, text: settings.watermarkText || 'Jadhav Architects' }
-        : { enabled: false, text: '' };
+        ? { enabled: true, text: settings.watermarkText || 'Parallel Paths' }
+        : { enabled: false, text: '' }
         
       const processedBlob = await processImageForWeb(blob, {
         maxWidth: 1920,
         preserveDimensions: blob.preserveDimensions,
         watermark: watermarkOptions
-      });
+      })
 
-      console.log("Uploading to Firebase Storage...");
-      const imageUrl = await uploadFile(processedBlob, `page_content/${uploadingSlot}_${Date.now()}.webp`);
-      console.log("Upload Success:", imageUrl);
-
-      console.log("Updating Firestore settings...");
-      await updateSetting(uploadingSlot, imageUrl);
-      console.log("Firestore update success");
-
-      setSettings(prev => ({ ...prev, [uploadingSlot]: imageUrl }));
-      
+      const imageUrl = await uploadFile(processedBlob, `page_content/${uploadingSlot}_${Date.now()}.webp`)
+      await updateSetting(uploadingSlot, imageUrl)
+      setSettings(prev => ({ ...prev, [uploadingSlot]: imageUrl }))
+      showToast("Page asset successfully updated", "success")
     } catch (err) {
-      console.error("Page Content Upload Error:", err);
-      window.alert('Failed to update image: ' + (err.message || 'Unknown error'));
+      console.error("Page Content Upload Error:", err)
+      showToast('Failed to update image: ' + (err.message || 'Unknown error'), "error")
     } finally {
-      setUploadingSlot(null);
-      setCropImage(null);
-      console.log("--- Page Content Upload Flow Complete ---");
+      setUploadingSlot(null)
+      setCropImage(null)
     }
-  };
-  // Prevent visual flickers or "Back Button" leaks by showing nothing until auth is confirmed
-  const bypassLoginForTesting = false; // Security: Ensure request.auth is populated in Firestore
+  }
+
+  // Filtered contacts calculation
+  const totalInquiriesCount = contacts.length
+  const pendingCount = contacts.filter(c => (c.status || 'Pending') === 'Pending').length
+  const acceptedCount = contacts.filter(c => c.status === 'Accepted').length
+  const inProgressCount = contacts.filter(c => c.status === 'In Progress').length
+  const completedCount = contacts.filter(c => c.status === 'Completed').length
+
+  const filteredInquiries = contacts.filter(item => {
+    const statusMatch = inquiryFilter === 'All' ? true : (item.status || 'Pending') === inquiryFilter
+    const searchMatch = !searchQuery ? true : (
+      (item.name || '').toLowerCase().includes(searchQuery.toLowerCase()) ||
+      (item.email || '').toLowerCase().includes(searchQuery.toLowerCase()) ||
+      (item.project || '').toLowerCase().includes(searchQuery.toLowerCase()) ||
+      (item.message || '').toLowerCase().includes(searchQuery.toLowerCase())
+    )
+    return statusMatch && searchMatch
+  })
+
+  const filteredTrackerProjects = contacts.filter(item => {
+    if (trackerFilter === 'All') return true
+    return (item.status || 'Pending') === trackerFilter
+  })
+
   if (isAuthChecking) {
     return (
       <div className="min-h-screen bg-background flex items-center justify-center">
@@ -176,11 +274,11 @@ export default function Admin() {
     )
   }
 
-  if (!isLoggedIn && !bypassLoginForTesting) {
+  if (!isLoggedIn) {
     return (
       <main className="min-h-screen flex items-center justify-center p-6 bg-background relative overflow-hidden">
         <Helmet>
-          <title>Admin Login | Jadhav Architects</title>
+          <title>Admin Login | Parallel Paths</title>
           <meta name="robots" content="noindex, nofollow" />
         </Helmet>
 
@@ -202,7 +300,7 @@ export default function Admin() {
 
           <form onSubmit={handleLogin} className="space-y-6">
             {loginError && (
-              <div className="bg-red-500/10 text-red-400 border border-red-500/20 p-4 rounded-lg font-body text-sm text-center">
+              <div className="bg-red-500/10 text-red-400 border border-red-500/20 p-4 rounded-xl font-body text-sm text-center">
                 {loginError}
               </div>
             )}
@@ -214,7 +312,7 @@ export default function Admin() {
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
                 placeholder="architect@parallel.com"
-                className="w-full bg-background/50 border border-white/10 rounded-xl p-4 font-body text-primary-text placeholder:text-white/5 focus:border-accent focus:outline-none transition-all"
+                className="w-full bg-[#120B07] border border-white/15 rounded-[12px] px-4 py-3.5 font-body text-primary-text placeholder:text-white/30 focus:border-accent focus:outline-none transition-all"
                 required
                 autoComplete="email"
               />
@@ -227,14 +325,14 @@ export default function Admin() {
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
                 placeholder="••••••••"
-                className="w-full bg-background/50 border border-white/10 rounded-xl p-4 font-body text-primary-text placeholder:text-white/10 focus:border-accent focus:outline-none transition-all tracking-widest"
+                className="w-full bg-[#120B07] border border-white/15 rounded-[12px] px-4 py-3.5 font-body text-primary-text placeholder:text-white/30 focus:border-accent focus:outline-none transition-all tracking-widest"
                 required
                 autoComplete="current-password"
               />
             </div>
             <button
                type="submit"
-               className="w-full bg-primary-text text-background font-headline font-bold uppercase tracking-[0.2em] py-5 rounded-full hover:bg-accent hover:text-on-accent transition-all duration-500 shadow-xl mt-4 active:scale-95"
+               className="w-full bg-primary-text text-background font-headline font-bold uppercase tracking-[0.2em] py-4 rounded-full hover:bg-accent hover:text-on-accent transition-all duration-300 shadow-xl mt-4 active:scale-95"
             >
               Authenticate
             </button>
@@ -247,10 +345,32 @@ export default function Admin() {
   return (
     <main className="min-h-screen bg-background flex">
       <Helmet>
-        <title>Dashboard | Jadhav Architects Admin</title>
+        <title>Dashboard | Parallel Paths Admin</title>
         <meta name="robots" content="noindex, nofollow" />
       </Helmet>
 
+      {/* Toast Notification */}
+      <AnimatePresence>
+        {toast.show && (
+          <motion.div
+            initial={{ opacity: 0, y: -20 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -20 }}
+            className={`fixed top-6 right-6 z-[250] px-5 py-3 rounded-2xl shadow-2xl border flex items-center gap-3 font-body text-xs ${
+              toast.type === 'error' 
+                ? 'bg-red-500/15 text-red-300 border-red-500/30' 
+                : 'bg-accent/15 text-accent border-accent/30 backdrop-blur-xl'
+            }`}
+          >
+            <span className="material-symbols-outlined text-lg">
+              {toast.type === 'error' ? 'error' : 'check_circle'}
+            </span>
+            <span className="font-medium">{toast.message}</span>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Project Upload / Edit Modal */}
       <ProjectModal 
         isOpen={isModalOpen} 
         onClose={() => { setIsModalOpen(false); setEditProjectData(null); }} 
@@ -258,6 +378,7 @@ export default function Admin() {
         initialData={editProjectData}
       />
 
+      {/* Page Content Crop Modal */}
       <ImageCropModal 
         isOpen={isCropModalOpen}
         image={cropImage}
@@ -265,6 +386,142 @@ export default function Admin() {
         onCropComplete={handleCropSave}
       />
 
+      {/* Inquiry Detail Modal */}
+      <AnimatePresence>
+        {selectedInquiryDetail && (
+          <div className="fixed inset-0 z-[220] flex items-center justify-center p-4 bg-background/90 backdrop-blur-md">
+            <motion.div
+              initial={{ opacity: 0, scale: 0.95 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.95 }}
+              className="bg-card-bg border border-white/10 rounded-[28px] p-6 sm:p-8 max-w-xl w-full shadow-2xl space-y-6"
+            >
+              <div className="flex justify-between items-start border-b border-white/5 pb-4">
+                <div>
+                  <span className="font-label text-[10px] tracking-[0.25em] uppercase text-accent font-semibold block mb-1">
+                    Client Details
+                  </span>
+                  <h3 className="font-headline font-bold text-xl text-primary-text">
+                    {selectedInquiryDetail.name}
+                  </h3>
+                </div>
+                <button
+                  onClick={() => setSelectedInquiryDetail(null)}
+                  className="w-9 h-9 rounded-full bg-white/5 hover:bg-white/10 text-primary-text/40 hover:text-primary-text flex items-center justify-center transition-all"
+                >
+                  <span className="material-symbols-outlined text-[18px]">close</span>
+                </button>
+              </div>
+
+              <div className="grid grid-cols-2 gap-4 text-xs">
+                <div className="bg-[#120B07] p-3.5 rounded-xl border border-white/5 space-y-1">
+                  <span className="font-label text-[9px] uppercase tracking-wider text-primary-text/40 block">Email</span>
+                  <a href={`mailto:${selectedInquiryDetail.email}`} className="text-accent hover:underline break-all">
+                    {selectedInquiryDetail.email}
+                  </a>
+                </div>
+                <div className="bg-[#120B07] p-3.5 rounded-xl border border-white/5 space-y-1">
+                  <span className="font-label text-[9px] uppercase tracking-wider text-primary-text/40 block">Project Scope</span>
+                  <span className="text-primary-text font-medium">{selectedInquiryDetail.project || 'Residential'}</span>
+                </div>
+                <div className="bg-[#120B07] p-3.5 rounded-xl border border-white/5 space-y-1">
+                  <span className="font-label text-[9px] uppercase tracking-wider text-primary-text/40 block">Received Date</span>
+                  <span className="text-primary-text">
+                    {selectedInquiryDetail.createdAt?.seconds 
+                      ? new Date(selectedInquiryDetail.createdAt.seconds * 1000).toLocaleString() 
+                      : 'N/A'}
+                  </span>
+                </div>
+                <div className="bg-[#120B07] p-3.5 rounded-xl border border-white/5 space-y-1">
+                  <span className="font-label text-[9px] uppercase tracking-wider text-primary-text/40 block">Current Stage</span>
+                  <span className={`inline-block px-2 py-0.5 rounded-full border text-[10px] font-headline font-bold uppercase tracking-wider ${
+                    STATUS_CONFIG[selectedInquiryDetail.status || 'Pending']?.badgeClass
+                  }`}>
+                    {selectedInquiryDetail.status || 'Pending'}
+                  </span>
+                </div>
+              </div>
+
+              <div className="space-y-2">
+                <span className="font-label text-[10px] uppercase tracking-wider text-primary-text/40 block">Message Content</span>
+                <div className="bg-[#120B07] p-4 rounded-xl border border-white/5 text-primary-text/90 font-body text-sm leading-relaxed whitespace-pre-wrap max-h-60 overflow-y-auto">
+                  {selectedInquiryDetail.message}
+                </div>
+              </div>
+
+              <div className="flex justify-between items-center pt-2">
+                <div className="flex items-center gap-2">
+                  <span className="text-[11px] font-label uppercase tracking-wider text-primary-text/40">Status:</span>
+                  <select
+                    value={selectedInquiryDetail.status || 'Pending'}
+                    onChange={(e) => {
+                      const newSt = e.target.value
+                      handleStatusChange(selectedInquiryDetail.id, newSt)
+                      setSelectedInquiryDetail(prev => ({ ...prev, status: newSt }))
+                    }}
+                    className="bg-[#120B07] border border-white/15 rounded-lg px-3 py-1.5 text-xs font-body text-primary-text focus:border-accent focus:outline-none"
+                  >
+                    {PIPELINE_STAGES.map(s => (
+                      <option key={s} value={s}>{s}</option>
+                    ))}
+                  </select>
+                </div>
+                <button
+                  onClick={() => setSelectedInquiryDetail(null)}
+                  className="px-5 py-2 bg-accent text-on-accent rounded-full font-headline text-xs font-bold uppercase tracking-wider"
+                >
+                  Done
+                </button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* Delete Confirmation Modal for Inquiry */}
+      <AnimatePresence>
+        {inquiryToDelete && (
+          <div className="fixed inset-0 z-[225] flex items-center justify-center p-4 bg-background/90 backdrop-blur-md">
+            <motion.div
+              initial={{ opacity: 0, scale: 0.95 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.95 }}
+              className="bg-card-bg border border-red-500/30 rounded-2xl p-6 sm:p-8 max-w-md w-full shadow-2xl space-y-6"
+            >
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-full bg-red-500/15 border border-red-500/30 flex items-center justify-center text-red-400">
+                  <span className="material-symbols-outlined text-xl">delete</span>
+                </div>
+                <div>
+                  <span className="font-label text-[10px] tracking-[0.25em] uppercase text-red-400 font-semibold block">Confirm Deletion</span>
+                  <h3 className="font-headline font-bold text-lg text-primary-text">Delete Inquiry?</h3>
+                </div>
+              </div>
+              <p className="font-body text-xs sm:text-sm text-primary-text/70 leading-relaxed">
+                Are you sure you want to permanently delete the inquiry from <strong className="text-primary-text">{inquiryToDelete.name}</strong> ({inquiryToDelete.email})? This record will be permanently removed.
+              </p>
+              <div className="flex gap-3 justify-end pt-2">
+                <button
+                  type="button"
+                  onClick={() => setInquiryToDelete(null)}
+                  className="px-4 py-2.5 rounded-xl font-headline text-xs font-bold uppercase tracking-wider text-primary-text/60 hover:text-primary-text transition-all"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={confirmDeleteInquiry}
+                  className="bg-red-500 text-white px-5 py-2.5 rounded-xl font-headline text-xs font-bold uppercase tracking-wider shadow-lg hover:bg-red-600 transition-all"
+                >
+                  Delete Inquiry
+                </button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* Sidebar Navigation */}
       <aside className="w-20 md:w-64 border-r border-white/5 flex flex-col bg-background z-20">
         <div className="p-6 md:p-8 border-b border-white/5 flex justify-center md:justify-start">
           <span className="font-headline font-black text-xl md:text-2xl tracking-tighter text-primary-text">PP.</span>
@@ -272,14 +529,15 @@ export default function Admin() {
         <nav className="flex-1 py-8 px-4 flex flex-col gap-2">
           {[
             { id: 'projects', icon: 'architecture', label: 'Projects' },
-            { id: 'content', icon: 'auto_awesome', label: 'Page Content' },
-            { id: 'inquiries', icon: 'mail', label: 'Inquiries' }
+            { id: 'tracker', icon: 'timeline', label: 'Project Tracker' },
+            { id: 'inquiries', icon: 'mail', label: 'Inquiries' },
+            { id: 'content', icon: 'auto_awesome', label: 'Page Content' }
           ].map((item) => (
             <button
               key={item.id}
               onClick={() => setCurrentTab(item.id)}
               className={`flex items-center gap-4 p-3 md:px-4 rounded-xl transition-all group ${
-                currentTab === item.id ? 'bg-accent/10 text-accent' : 'text-primary-text/40 hover:bg-white/5 hover:text-primary-text'
+                currentTab === item.id ? 'bg-accent/10 text-accent font-bold' : 'text-primary-text/40 hover:bg-white/5 hover:text-primary-text'
               }`}
             >
               <span className="material-symbols-outlined text-2xl">
@@ -300,272 +558,529 @@ export default function Admin() {
         </div>
       </aside>
 
+      {/* Main Panel Content */}
       <section className="flex-1 flex flex-col min-w-0 overflow-y-auto">
         <header className="h-20 border-b border-white/5 flex flex-row items-center justify-between px-4 md:px-12 sticky top-0 bg-background/80 backdrop-blur-md z-10">
           <h2 className="font-headline text-xs md:text-sm font-bold uppercase tracking-[0.2em] text-primary-text/60">
             {currentTab === 'projects' ? 'Portfolio Management' : 
-             currentTab === 'content' ? 'Global Page Content' : 'Inquiries Management'}
+             currentTab === 'tracker' ? 'Project Pipeline & Tracker' :
+             currentTab === 'inquiries' ? 'Inquiries Management' : 'Global Page Content'}
           </h2>
         </header>
 
-        <div className="p-4 md:p-12 lg:p-16 max-w-7xl">
+        <div className="p-4 md:p-12 lg:p-16 max-w-7xl w-full">
+          {/* =========================================================
+              TAB 1: PROJECTS (PORTFOLIO ARCHIVE)
+              ========================================================= */}
           {currentTab === 'projects' && (
             <>
-              <div className="flex flex-col md:flex-row justify-between items-start md:items-end gap-6 mb-16">
+              <div className="flex flex-col md:flex-row justify-between items-start md:items-end gap-6 mb-12">
                 <div>
-                  <span className="font-label text-[10px] tracking-[0.3em] uppercase text-accent mb-4 block">Dashboard</span>
-                  <h1 className="font-headline font-extrabold text-3xl md:text-6xl tracking-tighter text-primary-text uppercase">Project <span className="italic font-light">Archive</span></h1>
+                  <span className="font-label text-[10px] tracking-[0.3em] uppercase text-accent mb-2 block">Dashboard</span>
+                  <h1 className="font-headline font-extrabold text-3xl md:text-5xl tracking-tighter text-primary-text uppercase">
+                    Project <span className="italic font-light">Archive</span>
+                  </h1>
                 </div>
-                <button onClick={() => setIsModalOpen(true)} className="w-full md:w-auto bg-accent text-on-accent px-8 py-4 rounded-full font-headline font-bold text-xs uppercase tracking-widest shadow-xl hover:scale-105 transition-all flex items-center justify-center gap-2">
+                <button 
+                  onClick={() => { setEditProjectData(null); setIsModalOpen(true); }} 
+                  className="w-full md:w-auto bg-accent text-on-accent px-8 py-3.5 rounded-full font-headline font-bold text-xs uppercase tracking-widest shadow-xl hover:scale-105 active:scale-95 transition-all flex items-center justify-center gap-2"
+                >
                   <span className="material-symbols-outlined text-sm">add</span> Add New Piece
                 </button>
               </div>
 
-          <div className="bg-card-bg/30 border border-white/5 rounded-2xl overflow-hidden shadow-2xl">
-            <div className="overflow-x-auto">
-              <table className="w-full text-left font-body min-w-[800px] md:min-w-0">
-              <thead className="bg-white/5">
-                <tr>
-                  <th className="p-6 font-label text-[10px] tracking-[0.2em] uppercase text-primary-text/40">Work Title</th>
-                  <th className="p-6 font-label text-[10px] tracking-[0.2em] uppercase text-primary-text/40">Classification</th>
-                  <th className="p-6 font-label text-[10px] tracking-[0.2em] uppercase text-primary-text/40">Date</th>
-                  <th className="p-6 font-label text-[10px] tracking-[0.2em] uppercase text-primary-text/40 text-right">Visibility</th>
-                  <th className="p-6 font-label text-[10px] tracking-[0.2em] uppercase text-primary-text/40 text-right">Actions</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-white/5 text-primary-text/80">
-                {projects.map((row) => (
-                  <tr key={row.id} onClick={() => navigate(`/gallery/${row.id}`)} className="hover:bg-white/5 transition-colors group cursor-pointer">
-                    <td className="p-6 flex items-center gap-4">
-                      <div className="w-12 h-12 bg-white/5 rounded-lg overflow-hidden shrink-0 flex items-center justify-center">
-                        {row.images?.[0] ? <img src={row.images[0]?.url || row.images[0]} className="w-full h-full object-cover" /> : <span className="material-symbols-outlined text-white/20">architecture</span>}
-                      </div>
-                      <span className="font-headline text-xs font-bold uppercase tracking-wider">{row.title}</span>
-                    </td>
-                    <td className="p-6 text-sm">{row.category || 'Architecture'}</td>
-                    <td className="p-6 text-sm">
-                      {row.createdAt?.seconds ? new Date(row.createdAt.seconds * 1000).toLocaleDateString() : 'N/A'}
-                    </td>
-                    <td className="p-6 text-right">
-                      <span className="text-[8px] font-bold uppercase tracking-[0.2em] px-3 py-1.5 rounded-full border border-accent/30 text-accent bg-accent/5">
-                        Published
-                      </span>
-                    </td>
-                    <td className="p-6 text-right flex justify-end gap-2 items-center">
-                       <button onClick={(e) => handleEditProject(row, e)} className="p-2 bg-white/5 hover:bg-accent/20 rounded-lg text-primary-text/60 hover:text-accent transition-colors flex items-center justify-center" title="Edit Project">
-                         <span className="material-symbols-outlined text-[16px]">edit</span>
-                       </button>
-                       <button onClick={(e) => handleDeleteProject(row.id, e)} className="p-2 bg-white/5 hover:bg-red-500/20 rounded-lg text-primary-text/60 hover:text-red-400 transition-colors flex items-center justify-center" title="Delete Project">
-                         <span className="material-symbols-outlined text-[16px]">delete</span>
-                       </button>
-                    </td>
-                  </tr>
-                ))}
-                {projects.length === 0 && (
-                   <tr>
-                     <td colSpan="4" className="p-8 text-center text-primary-text/40 text-sm">
-                        No projects found in the archive.
-                     </td>
-                   </tr>
-                )}
-              </tbody>
-            </table>
-          </div>
-        </div>
-          </>
-        )}
+              <div className="bg-card-bg/30 border border-white/5 rounded-2xl overflow-hidden shadow-2xl">
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left font-body min-w-[750px] md:min-w-0">
+                    <thead className="bg-white/5">
+                      <tr>
+                        <th className="p-6 font-label text-[10px] tracking-[0.2em] uppercase text-primary-text/40">Work Title</th>
+                        <th className="p-6 font-label text-[10px] tracking-[0.2em] uppercase text-primary-text/40">Classification</th>
+                        <th className="p-6 font-label text-[10px] tracking-[0.2em] uppercase text-primary-text/40">Date</th>
+                        <th className="p-6 font-label text-[10px] tracking-[0.2em] uppercase text-primary-text/40 text-right">Visibility</th>
+                        <th className="p-6 font-label text-[10px] tracking-[0.2em] uppercase text-primary-text/40 text-right">Actions</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-white/5 text-primary-text/80">
+                      {projects.map((row) => (
+                        <tr key={row.id} onClick={() => navigate(`/gallery/${row.id}`)} className="hover:bg-white/5 transition-colors group cursor-pointer">
+                          <td className="p-6 flex items-center gap-4">
+                            <div className="w-12 h-12 bg-white/5 rounded-lg overflow-hidden shrink-0 flex items-center justify-center">
+                              {row.images?.[0] ? (
+                                <img src={row.images[0]?.url || row.images[0]} className="w-full h-full object-cover" alt={row.title} />
+                              ) : (
+                                <span className="material-symbols-outlined text-white/20">architecture</span>
+                              )}
+                            </div>
+                            <span className="font-headline text-xs font-bold uppercase tracking-wider">{row.title}</span>
+                          </td>
+                          <td className="p-6 text-sm">{row.subtitle || row.category || 'Architecture'}</td>
+                          <td className="p-6 text-sm">
+                            {row.createdAt?.seconds ? new Date(row.createdAt.seconds * 1000).toLocaleDateString() : 'N/A'}
+                          </td>
+                          <td className="p-6 text-right">
+                            <span className="text-[9px] font-bold uppercase tracking-[0.2em] px-3 py-1.5 rounded-full border border-accent/30 text-accent bg-accent/5">
+                              Published
+                            </span>
+                          </td>
+                          <td className="p-6 text-right flex justify-end gap-2 items-center">
+                             <button 
+                               onClick={(e) => handleEditProject(row, e)} 
+                               className="p-2 bg-white/5 hover:bg-accent/20 rounded-lg text-primary-text/60 hover:text-accent transition-colors flex items-center justify-center" 
+                               title="Edit Project"
+                             >
+                               <span className="material-symbols-outlined text-[16px]">edit</span>
+                             </button>
+                             <button 
+                               onClick={(e) => handleDeleteProject(row.id, e)} 
+                               className="p-2 bg-white/5 hover:bg-red-500/20 rounded-lg text-primary-text/60 hover:text-red-400 transition-colors flex items-center justify-center" 
+                               title="Delete Project"
+                             >
+                               <span className="material-symbols-outlined text-[16px]">delete</span>
+                             </button>
+                          </td>
+                        </tr>
+                      ))}
+                      {projects.length === 0 && (
+                         <tr>
+                           <td colSpan="5" className="p-10 text-center text-primary-text/40 text-sm">
+                              No projects found in the archive. Click "Add New Piece" to publish your first work.
+                           </td>
+                         </tr>
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </>
+          )}
 
-        {currentTab === 'content' && (
-          <div className="space-y-16">
-            <div className="flex flex-col md:flex-row justify-between items-start md:items-end gap-6">
-              <div>
-                <span className="font-label text-[10px] tracking-[0.3em] uppercase text-accent mb-4 block">Dashboard</span>
-                <h1 className="font-headline font-extrabold text-3xl md:text-6xl tracking-tighter text-primary-text uppercase">Page <span className="italic font-light">Content</span></h1>
+          {/* =========================================================
+              TAB 2: PROJECT TRACKER (DEDICATED PIPELINE)
+              ========================================================= */}
+          {currentTab === 'tracker' && (
+            <div className="space-y-10">
+              <div className="flex flex-col md:flex-row justify-between items-start md:items-end gap-6">
+                <div>
+                  <span className="font-label text-[10px] tracking-[0.3em] uppercase text-accent mb-2 block font-semibold">
+                    Client Lifecycle
+                  </span>
+                  <h1 className="font-headline font-extrabold text-3xl md:text-5xl tracking-tighter text-primary-text uppercase">
+                    Project <span className="italic font-light">Tracker</span>
+                  </h1>
+                  <p className="font-body text-xs text-primary-text/50 mt-1 max-w-lg">
+                    Manage client design workflows from initial inquiry submission through completion.
+                  </p>
+                </div>
+              </div>
+
+              {/* Summary Cards */}
+              <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-4">
+                {[
+                  { label: 'Total Inquiries', count: totalInquiriesCount, icon: 'folder_open', color: 'text-primary-text' },
+                  { label: 'Pending Review', count: pendingCount, icon: 'hourglass_empty', color: 'text-amber-400' },
+                  { label: 'Accepted', count: acceptedCount, icon: 'check_circle', color: 'text-emerald-400' },
+                  { label: 'In Progress', count: inProgressCount, icon: 'construction', color: 'text-sky-400' },
+                  { label: 'Completed', count: completedCount, icon: 'task_alt', color: 'text-purple-400' }
+                ].map((stat, idx) => (
+                  <div key={idx} className="bg-card-bg/40 border border-white/5 rounded-2xl p-5 flex flex-col justify-between">
+                    <div className="flex items-center justify-between mb-3">
+                      <span className="font-label text-[9px] tracking-[0.2em] uppercase text-primary-text/40 font-semibold">
+                        {stat.label}
+                      </span>
+                      <span className={`material-symbols-outlined text-lg ${stat.color} opacity-80`}>
+                        {stat.icon}
+                      </span>
+                    </div>
+                    <div className="font-headline text-3xl font-extrabold text-primary-text">
+                      {stat.count}
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              {/* Status Filters */}
+              <div className="flex flex-wrap items-center gap-2 pt-2">
+                {['All', 'Accepted', 'In Progress', 'Completed', 'Pending', 'Rejected'].map(status => {
+                  const count = status === 'All' ? totalInquiriesCount : contacts.filter(c => (c.status || 'Pending') === status).length
+                  return (
+                    <button
+                      key={status}
+                      onClick={() => setTrackerFilter(status)}
+                      className={`px-4 py-2 rounded-xl font-headline text-xs font-bold uppercase tracking-wider transition-all border ${
+                        trackerFilter === status 
+                          ? 'bg-accent text-on-accent border-accent shadow-md' 
+                          : 'bg-white/5 border-white/5 text-primary-text/50 hover:bg-white/10 hover:text-primary-text'
+                      }`}
+                    >
+                      {status} ({count})
+                    </button>
+                  )
+                })}
+              </div>
+
+              {/* Tracker Records Table */}
+              <div className="bg-card-bg/30 border border-white/5 rounded-2xl overflow-hidden shadow-2xl">
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left font-body min-w-[850px] md:min-w-0">
+                    <thead className="bg-white/5">
+                      <tr>
+                        <th className="p-5 font-label text-[10px] tracking-[0.2em] uppercase text-primary-text/40">Client</th>
+                        <th className="p-5 font-label text-[10px] tracking-[0.2em] uppercase text-primary-text/40">Project / Scope</th>
+                        <th className="p-5 font-label text-[10px] tracking-[0.2em] uppercase text-primary-text/40">Contact</th>
+                        <th className="p-5 font-label text-[10px] tracking-[0.2em] uppercase text-primary-text/40">Submission Date</th>
+                        <th className="p-5 font-label text-[10px] tracking-[0.2em] uppercase text-primary-text/40">Current Stage</th>
+                        <th className="p-5 font-label text-[10px] tracking-[0.2em] uppercase text-primary-text/40 text-right">Workflow Action</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-white/5 text-primary-text/80">
+                      {filteredTrackerProjects.map((row) => {
+                        const currentStatus = row.status || 'Pending'
+                        const statusMeta = STATUS_CONFIG[currentStatus] || STATUS_CONFIG['Pending']
+
+                        return (
+                          <tr key={row.id} className="hover:bg-white/5 transition-colors group">
+                            <td className="p-5 font-headline text-xs font-bold uppercase tracking-wider text-primary-text">
+                              {row.name}
+                            </td>
+                            <td className="p-5 text-sm text-primary-text/80">
+                              <span className="font-medium">{row.project || 'Architectural Inquiry'}</span>
+                            </td>
+                            <td className="p-5 text-sm text-accent/80 hover:text-accent transition-colors">
+                              <a href={`mailto:${row.email}`}>{row.email}</a>
+                            </td>
+                            <td className="p-5 text-sm text-primary-text/50">
+                              {row.createdAt?.seconds ? new Date(row.createdAt.seconds * 1000).toLocaleDateString() : 'N/A'}
+                            </td>
+                            <td className="p-5">
+                              <span className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full border text-[10px] font-headline font-bold uppercase tracking-wider ${statusMeta.badgeClass}`}>
+                                <span className="material-symbols-outlined text-[13px]">{statusMeta.icon}</span>
+                                {currentStatus}
+                              </span>
+                            </td>
+                            <td className="p-5 text-right flex justify-end items-center gap-3">
+                              <select
+                                value={currentStatus}
+                                onChange={(e) => handleStatusChange(row.id, e.target.value)}
+                                className="bg-[#120B07] border border-white/15 rounded-lg px-3 py-1.5 text-xs font-body text-primary-text focus:border-accent focus:outline-none cursor-pointer"
+                              >
+                                {PIPELINE_STAGES.map(s => (
+                                  <option key={s} value={s}>{s}</option>
+                                ))}
+                              </select>
+                              <button
+                                onClick={() => setSelectedInquiryDetail(row)}
+                                className="p-1.5 bg-white/5 hover:bg-white/15 rounded-lg text-primary-text/60 hover:text-accent transition-colors"
+                                title="View Client Brief"
+                              >
+                                <span className="material-symbols-outlined text-[18px]">visibility</span>
+                              </button>
+                            </td>
+                          </tr>
+                        )
+                      })}
+                      {filteredTrackerProjects.length === 0 && (
+                        <tr>
+                          <td colSpan="6" className="p-10 text-center text-primary-text/40 text-sm">
+                            No project tracker records found in the "{trackerFilter}" stage.
+                          </td>
+                        </tr>
+                      )}
+                    </tbody>
+                  </table>
+                </div>
               </div>
             </div>
+          )}
 
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
-              {/* Watermark Settings */}
-              <div className="bg-card-bg/30 border border-white/5 p-8 rounded-3xl space-y-8 lg:col-span-2">
-                <div className="flex items-center gap-4">
-                  <span className="material-symbols-outlined text-accent">branding_watermark</span>
-                  <h3 className="font-headline font-bold text-lg uppercase tracking-wider text-primary-text">Global Watermark Settings</h3>
+          {/* =========================================================
+              TAB 3: INQUIRIES (MANAGEMENT & DETAIL)
+              ========================================================= */}
+          {currentTab === 'inquiries' && (
+            <div className="space-y-10">
+              <div className="flex flex-col md:flex-row justify-between items-start md:items-end gap-6">
+                <div>
+                  <span className="font-label text-[10px] tracking-[0.3em] uppercase text-accent mb-2 block font-semibold">
+                    Client Communications
+                  </span>
+                  <h1 className="font-headline font-extrabold text-3xl md:text-5xl tracking-tighter text-primary-text uppercase">
+                    Direct <span className="italic font-light">Inquiries</span>
+                  </h1>
                 </div>
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
-                  <div className="space-y-4 flex flex-col justify-center">
-                    <label className="flex items-center gap-4 cursor-pointer text-primary-text/80 hover:text-white transition-colors">
-                      <input 
-                        type="checkbox" 
-                        checked={settings.watermarkEnabled || false} 
-                        onChange={async (e) => {
-                          const val = e.target.checked;
-                          setSettings(prev => ({ ...prev, watermarkEnabled: val }));
-                          await updateSetting('watermarkEnabled', val);
-                        }}
-                        className="accent-accent w-5 h-5" 
-                      />
-                      <span className="font-label tracking-[0.2em] uppercase text-sm">Enable Watermark on Uploads</span>
-                    </label>
-                  </div>
-                  <div className="space-y-2">
-                    <label className="font-label text-[10px] tracking-[0.2em] uppercase text-primary-text/40 ml-1">Watermark Text</label>
-                    <input 
-                      type="text" 
-                      value={settings.watermarkText || ''} 
-                      onChange={(e) => setSettings(prev => ({ ...prev, watermarkText: e.target.value }))}
-                      onBlur={async () => await updateSetting('watermarkText', settings.watermarkText)}
-                      placeholder="e.g. Jadhav Architects" 
-                      className="w-full bg-background/50 border border-white/10 rounded-xl p-4 font-body text-primary-text focus:border-accent focus:outline-none transition-colors" 
-                    />
-                  </div>
+
+                {/* Search field */}
+                <div className="w-full md:w-72">
+                  <input
+                    type="text"
+                    value={searchQuery}
+                    onChange={(e) => setSearchQuery(e.target.value)}
+                    placeholder="Search sender, email, project..."
+                    className="w-full bg-[#120B07] border border-white/15 rounded-xl px-4 py-2.5 text-xs font-body text-primary-text placeholder:text-white/30 focus:border-accent focus:outline-none transition-colors"
+                  />
                 </div>
               </div>
 
-              {/* Home Page Section */}
-              <div className="bg-card-bg/30 border border-white/5 p-8 rounded-3xl space-y-8">
-                <div className="flex items-center gap-4">
-                  <span className="material-symbols-outlined text-accent">home</span>
-                  <h3 className="font-headline font-bold text-lg uppercase tracking-wider text-primary-text">Home Page</h3>
+              {/* Status Filter Badges */}
+              <div className="flex flex-wrap items-center gap-2">
+                {['All', 'Pending', 'Accepted', 'In Progress', 'Completed', 'Rejected'].map(status => {
+                  const count = status === 'All' ? totalInquiriesCount : contacts.filter(c => (c.status || 'Pending') === status).length
+                  return (
+                    <button
+                      key={status}
+                      onClick={() => setInquiryFilter(status)}
+                      className={`px-3.5 py-1.5 rounded-xl font-headline text-xs font-bold uppercase tracking-wider transition-all border ${
+                        inquiryFilter === status 
+                          ? 'bg-accent text-on-accent border-accent shadow-md' 
+                          : 'bg-white/5 border-white/5 text-primary-text/50 hover:bg-white/10 hover:text-primary-text'
+                      }`}
+                    >
+                      {status} ({count})
+                    </button>
+                  )
+                })}
+              </div>
+
+              {/* Inquiries Table */}
+              <div className="bg-card-bg/30 border border-white/5 rounded-2xl overflow-hidden shadow-2xl">
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left font-body min-w-[850px] md:min-w-0">
+                    <thead className="bg-white/5">
+                      <tr>
+                        <th className="p-5 font-label text-[10px] tracking-[0.2em] uppercase text-primary-text/40">Sender</th>
+                        <th className="p-5 font-label text-[10px] tracking-[0.2em] uppercase text-primary-text/40">Contact / Email</th>
+                        <th className="p-5 font-label text-[10px] tracking-[0.2em] uppercase text-primary-text/40">Project</th>
+                        <th className="p-5 font-label text-[10px] tracking-[0.2em] uppercase text-primary-text/40">Message</th>
+                        <th className="p-5 font-label text-[10px] tracking-[0.2em] uppercase text-primary-text/40">Status</th>
+                        <th className="p-5 font-label text-[10px] tracking-[0.2em] uppercase text-primary-text/40 text-right">Actions</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-white/5 text-primary-text/80">
+                      {filteredInquiries.map((row) => {
+                        const currentStatus = row.status || 'Pending'
+                        const statusMeta = STATUS_CONFIG[currentStatus] || STATUS_CONFIG['Pending']
+
+                        return (
+                          <tr key={row.id} className="hover:bg-white/5 transition-colors group">
+                            <td className="p-5 font-headline text-xs font-bold uppercase tracking-wider text-primary-text">
+                              {row.name}
+                            </td>
+                            <td className="p-5 text-sm text-accent/80 hover:text-accent transition-colors">
+                              <a href={`mailto:${row.email}`}>{row.email}</a>
+                            </td>
+                            <td className="p-5 text-xs text-primary-text/70">
+                              {row.project || 'Residential'}
+                            </td>
+                            <td className="p-5 text-sm max-w-xs">
+                              <p 
+                                onClick={() => setSelectedInquiryDetail(row)} 
+                                className="truncate cursor-pointer hover:text-accent transition-colors" 
+                                title={row.message}
+                              >
+                                {row.message}
+                              </p>
+                            </td>
+                            <td className="p-5">
+                              <span className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full border text-[10px] font-headline font-bold uppercase tracking-wider ${statusMeta.badgeClass}`}>
+                                <span className="material-symbols-outlined text-[13px]">{statusMeta.icon}</span>
+                                {currentStatus}
+                              </span>
+                            </td>
+                            <td className="p-5 text-right flex justify-end gap-2 items-center">
+                              {/* Stage Selector */}
+                              <select
+                                value={currentStatus}
+                                onChange={(e) => handleStatusChange(row.id, e.target.value)}
+                                className="bg-[#120B07] border border-white/15 rounded-lg px-2.5 py-1 text-xs font-body text-primary-text focus:border-accent focus:outline-none cursor-pointer"
+                              >
+                                {PIPELINE_STAGES.map(s => (
+                                  <option key={s} value={s}>{s}</option>
+                                ))}
+                              </select>
+
+                              {/* View detail */}
+                              <button
+                                onClick={() => setSelectedInquiryDetail(row)}
+                                className="p-1.5 bg-white/5 hover:bg-white/15 rounded-lg text-primary-text/60 hover:text-accent transition-colors"
+                                title="View Message"
+                              >
+                                <span className="material-symbols-outlined text-[16px]">visibility</span>
+                              </button>
+
+                              {/* Delete */}
+                              <button
+                                onClick={() => setInquiryToDelete(row)}
+                                className="p-1.5 bg-white/5 hover:bg-red-500/20 rounded-lg text-primary-text/60 hover:text-red-400 transition-colors"
+                                title="Delete Inquiry"
+                              >
+                                <span className="material-symbols-outlined text-[16px]">delete</span>
+                              </button>
+                            </td>
+                          </tr>
+                        )
+                      })}
+                      {filteredInquiries.length === 0 && (
+                        <tr>
+                          <td colSpan="6" className="p-10 text-center text-primary-text/40 text-sm">
+                            No inquiries match the selected criteria.
+                          </td>
+                        </tr>
+                      )}
+                    </tbody>
+                  </table>
                 </div>
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
-                  <div className="space-y-4">
-                    <label className="font-label text-[10px] tracking-[0.2em] uppercase text-primary-text/40 block">Hero Background Image</label>
-                    <div className="relative group rounded-2xl overflow-hidden aspect-video bg-white/5 border border-white/5">
-                      <img src={settings.homeHero || "https://lh3.googleusercontent.com/aida-public/AB6AXuDar4SRBvcnU0_eViIb5fyO6-f6Zg02ySzjPtWTMwm8iYT0H9OjezC7W7-tjQCRve3hTgB6-XpE_4xTAZx4K8djySAxk3G_I2ix6WIMR4c6xnP6bF2NDOtiisni9DCp8PyZsIwCIvNlcg95p7mcSX1XhdeRETG7NrwBx_en3kVoK7FHbmV9qyFSDYBRFRkVUJbVw8K2EMkUp8P6tfogfU3vTyQPAh1udNBEljnTmRqNRbT8uxw2LFelO0HSQcOXa6ITNvRSabgf7l9l"} className="w-full h-full object-cover opacity-50" alt="Home hero" />
-                      <div className="absolute inset-0 flex items-center justify-center">
-                        <label className="cursor-pointer bg-accent text-on-accent px-6 py-3 rounded-full font-headline font-bold text-[10px] uppercase tracking-widest shadow-xl hover:scale-105 transition-all flex items-center gap-2">
-                          {uploadingSlot === 'homeHero' ? <div className="w-4 h-4 border-2 border-on-accent border-t-transparent rounded-full animate-spin" /> : <span className="material-symbols-outlined text-sm">cloud_upload</span>}
-                          Update Home Hero
-                          <input type="file" accept="image/*" className="hidden" onChange={(e) => handleImageUpdate('homeHero', e)} disabled={uploadingSlot === 'homeHero'} />
-                        </label>
-                      </div>
-                    </div>
-                  </div>
-                  <div className="space-y-4">
-                    <label className="font-label text-[10px] tracking-[0.2em] uppercase text-primary-text/40 block">Featured Project Image</label>
-                    <div className="relative group rounded-2xl overflow-hidden aspect-video bg-white/5 border border-white/5">
-                      <img src={settings.homeFeaturedImage || "https://lh3.googleusercontent.com/aida-public/AB6AXuANbIL4n3isYdQZkVxQLQGvTdocx1Z5T8RkPdPW5psdhKjVpSzhMAHb2anWRSlDSAePOYnMs26pC2ttf8YuR5u8pGuGrhv8PDFzlE646PKVe8qHo0zpFERgwuJsu_9NFHNE48cgvnOL_NG4ObsNooVxXpVdOdisR0lkTuCyxIJE5ekJAa5FW_8LP3rlCLH2SOXMNFeSiz0l78KChdMDIsqMzLF1ewlK6D_nav19k5OVOni0yJ9eh7kpXcI5KWlmsXk2fhOK4RIgFJmA"} className="w-full h-full object-cover opacity-50" alt="Featured project" />
-                      <div className="absolute inset-0 flex items-center justify-center">
-                        <label className="cursor-pointer bg-accent text-on-accent px-6 py-3 rounded-full font-headline font-bold text-[10px] uppercase tracking-widest shadow-xl hover:scale-105 transition-all flex items-center gap-2">
-                          {uploadingSlot === 'homeFeaturedImage' ? <div className="w-4 h-4 border-2 border-on-accent border-t-transparent rounded-full animate-spin" /> : <span className="material-symbols-outlined text-sm">cloud_upload</span>}
-                          Update Featured Image
-                          <input type="file" accept="image/*" className="hidden" onChange={(e) => handleImageUpdate('homeFeaturedImage', e)} disabled={uploadingSlot === 'homeFeaturedImage'} />
-                        </label>
-                      </div>
-                    </div>
-                  </div>
-                  <div className="space-y-4 md:col-span-2">
-                    <label className="font-label text-[10px] tracking-[0.2em] uppercase text-primary-text/40 block">Practice House Render</label>
-                    <div className="relative group rounded-2xl overflow-hidden aspect-[2/1] bg-white/5 border border-white/5">
-                      <img src={settings.homeIntroImage || houseRender} className={`w-full h-full object-contain p-4 ${settings.homeIntroImage ? 'opacity-50' : 'opacity-0'}`} alt="Practice house render" />
-                      <div className="absolute inset-0 flex items-center justify-center">
-                        <label className="cursor-pointer bg-accent text-on-accent px-6 py-3 rounded-full font-headline font-bold text-[10px] uppercase tracking-widest shadow-xl hover:scale-105 transition-all flex items-center gap-2">
-                          {uploadingSlot === 'homeIntroImage' ? <div className="w-4 h-4 border-2 border-on-accent border-t-transparent rounded-full animate-spin" /> : <span className="material-symbols-outlined text-sm">cloud_upload</span>}
-                          Update House Render
-                          <input type="file" accept="image/png,image/jpeg,image/webp" className="hidden" onChange={(e) => handleImageUpdate('homeIntroImage', e)} disabled={uploadingSlot === 'homeIntroImage'} />
-                        </label>
-                      </div>
-                    </div>
-                  </div>
+              </div>
+            </div>
+          )}
+
+          {/* =========================================================
+              TAB 4: PAGE CONTENT
+              ========================================================= */}
+          {currentTab === 'content' && (
+            <div className="space-y-16">
+              <div className="flex flex-col md:flex-row justify-between items-start md:items-end gap-6">
+                <div>
+                  <span className="font-label text-[10px] tracking-[0.3em] uppercase text-accent mb-4 block">Dashboard</span>
+                  <h1 className="font-headline font-extrabold text-3xl md:text-6xl tracking-tighter text-primary-text uppercase">Page <span className="italic font-light">Content</span></h1>
                 </div>
               </div>
 
-              {/* Services Page Section */}
-              <div className="bg-card-bg/30 border border-white/5 p-8 rounded-3xl space-y-8">
-                <div className="flex items-center gap-4">
-                  <span className="material-symbols-outlined text-accent">architecture</span>
-                  <h3 className="font-headline font-bold text-lg uppercase tracking-wider text-primary-text">Services Page</h3>
-                </div>
-                <div className="space-y-4">
-                  <label className="font-label text-[10px] tracking-[0.2em] uppercase text-primary-text/40 block">Floating Model Image</label>
-                  <div className="relative group rounded-2xl overflow-hidden aspect-video bg-white/5 border border-white/5">
-                    <img src={settings.servicesModel || "https://lh3.googleusercontent.com/aida-public/AB6AXuAmLJLVr-u5vNVg6-5nELs24TrHcXnBR4dA_jA70oaCkN5povJEHW_iLFR6JvqhpCQZqa74snkvGEuBRyGFGptS7byLjSN4mwLcuaW3ua03qRmdCIrkW_KTZD2xWsEgWtoUVE0avhroUhdgjn_Si49kb1DiWVF6Z6tJ6zzQIpazT4_CTCfQsW4HHOTtWVQduvv1pndQjMFHTjWVWLWGfucRDm3NU7lXFjKPlOGORw-_vs1cqJNCa-YP5fg6Mzm4hI5dhvRvbrkIneHQ"} className="w-full h-full object-contain mix-blend-lighten opacity-50" alt="Services Model" />
-                    <div className="absolute inset-0 flex items-center justify-center">
-                      <label className="cursor-pointer bg-accent text-on-accent px-6 py-3 rounded-full font-headline font-bold text-[10px] uppercase tracking-widest shadow-xl hover:scale-105 transition-all flex items-center gap-2">
-                        {uploadingSlot === 'servicesModel' ? <div className="w-4 h-4 border-2 border-on-accent border-t-transparent rounded-full animate-spin" /> : <span className="material-symbols-outlined text-sm">cloud_upload</span>}
-                        Update Services Model
-                        <input type="file" accept="image/*" className="hidden" onChange={(e) => handleImageUpdate('servicesModel', e)} disabled={uploadingSlot === 'servicesModel'} />
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
+                {/* Watermark Settings */}
+                <div className="bg-card-bg/30 border border-white/5 p-8 rounded-3xl space-y-8 lg:col-span-2">
+                  <div className="flex items-center gap-4">
+                    <span className="material-symbols-outlined text-accent">branding_watermark</span>
+                    <h3 className="font-headline font-bold text-lg uppercase tracking-wider text-primary-text">Global Watermark Settings</h3>
+                  </div>
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
+                    <div className="space-y-4 flex flex-col justify-center">
+                      <label className="flex items-center gap-4 cursor-pointer text-primary-text/80 hover:text-white transition-colors">
+                        <input 
+                          type="checkbox" 
+                          checked={settings.watermarkEnabled || false} 
+                          onChange={async (e) => {
+                            const val = e.target.checked;
+                            setSettings(prev => ({ ...prev, watermarkEnabled: val }));
+                            await updateSetting('watermarkEnabled', val);
+                          }}
+                          className="accent-accent w-5 h-5" 
+                        />
+                        <span className="font-label tracking-[0.2em] uppercase text-sm">Enable Watermark on Uploads</span>
                       </label>
                     </div>
+                    <div className="space-y-2">
+                      <label className="font-label text-[10px] tracking-[0.2em] uppercase text-primary-text/40 ml-1">Watermark Text</label>
+                      <input 
+                        type="text" 
+                        value={settings.watermarkText || ''} 
+                        onChange={(e) => setSettings(prev => ({ ...prev, watermarkText: e.target.value }))}
+                        onBlur={async () => await updateSetting('watermarkText', settings.watermarkText)}
+                        placeholder="e.g. Parallel Paths" 
+                        className="w-full bg-[#120B07] border border-white/15 rounded-xl p-4 font-body text-primary-text focus:border-accent focus:outline-none transition-colors" 
+                      />
+                    </div>
                   </div>
                 </div>
-              </div>
 
-              {/* About Page Portfolio */}
-              <div className="bg-card-bg/30 border border-white/5 p-8 rounded-3xl space-y-10 lg:col-span-2">
-                <div className="flex items-center gap-4">
-                  <span className="material-symbols-outlined text-accent">person</span>
-                  <h3 className="font-headline font-bold text-lg uppercase tracking-wider text-primary-text">About Page Assets</h3>
-                </div>
-                <div className="grid grid-cols-1 md:grid-cols-3 gap-8">
-                  {[
-                    { id: 'aboutPortrait', label: 'Main Portrait', default: "https://lh3.googleusercontent.com/aida-public/AB6AXuDFbeSpEsP4UlxheqYTjaSPhvQyzC42RjwGaNVPdj5E8bP5u9evp0DK1kMT2gg4HjqD74UsnZJuTXOAXZ6BZrvjBNZdqbg6t_-G5A5OC50iqAk25I8u77-4Aq-xvZrN00KYPjogwZKXcKggof0kINXeqZs2k825ZDmlZiqL-tJ93RdxGY1vGyJAp95vnMdDtym1wdK-cmC0xt9J8N-F_boBUEe30vT6Vw9oy85Amm8d_BRVHd5s2Qe8hiksHPkeCHir16qfORTjssEn" },
-                    { id: 'aboutPhilosophy', label: 'Philosophy Detail', default: "https://lh3.googleusercontent.com/aida-public/AB6AXuCJR59X0MEgm3EDXP0vXKABKq6E9IsYS73RpHgcORBrndrCSvo0LCQ5vBpVB8dgALoriBrFEODZFfZ8wGzvyup3oD9_Q18LWirI1ASAznfOEfKfHlu6_FRaxWKxHcK0AH8dJ7aqrpo0L1DjKoCJiGp2TGTe725fjj0Ii6y4mhe3kpM2We-e_B2Od1IP0O8-VfogcAz2gkqWtv2E-Y9R0wPc7g-7W-Dd_5Dect6AQ4ucVe1zl80lm_AewrdkYIGo3ZYAOM82U5T3cnk_" },
-                    { id: 'aboutResilience', label: 'Resilience Abstract', default: "https://lh3.googleusercontent.com/aida-public/AB6AXuBbo_EdStQMs7fOy5oIB3kyfoN38-gC-8VxrG-gzeUTro7_zWf6Za4fa3Et4FM9alG_yq0AFPZnb_ssuDmjXuggHfENKp1gAc7CwpJhwd9m_Fn2y966cbjoUh68JDhgCqlc1Tfnosy0-hMzTJVnpp68LLjtrq9B5JprTsU2yXquRnoGiptQzuiQ4-UwqRdtFEc2SOm_RNn9kzmRKo5pfCCs3UlRd1KD1qLHFT8IOLs1hSa6eYHDWbPfRKdq0ccmOOl_lQAgw772l4iO" }
-                  ].map(slot => (
-                    <div key={slot.id} className="space-y-4">
-                      <label className="font-label text-[10px] tracking-[0.2em] uppercase text-primary-text/40 block">{slot.label}</label>
-                      <div className="relative group rounded-2xl overflow-hidden aspect-[4/5] bg-white/5 border border-white/5">
-                        <img src={settings[slot.id] || slot.default} className="w-full h-full object-cover opacity-50" alt={slot.label} />
+                {/* Home Page Section */}
+                <div className="bg-card-bg/30 border border-white/5 p-8 rounded-3xl space-y-8">
+                  <div className="flex items-center gap-4">
+                    <span className="material-symbols-outlined text-accent">home</span>
+                    <h3 className="font-headline font-bold text-lg uppercase tracking-wider text-primary-text">Home Page</h3>
+                  </div>
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
+                    <div className="space-y-4">
+                      <label className="font-label text-[10px] tracking-[0.2em] uppercase text-primary-text/40 block">Hero Background Image</label>
+                      <div className="relative group rounded-2xl overflow-hidden aspect-video bg-white/5 border border-white/5">
+                        <img src={settings.homeHero || "https://lh3.googleusercontent.com/aida-public/AB6AXuDar4SRBvcnU0_eViIb5fyO6-f6Zg02ySzjPtWTMwm8iYT0H9OjezC7W7-tjQCRve3hTgB6-XpE_4xTAZx4K8djySAxk3G_I2ix6WIMR4c6xnP6bF2NDOtiisni9DCp8PyZsIwCIvNlcg95p7mcSX1XhdeRETG7NrwBx_en3kVoK7FHbmV9qyFSDYBRFRkVUJbVw8K2EMkUp8P6tfogfU3vTyQPAh1udNBEljnTmRqNRbT8uxw2LFelO0HSQcOXa6ITNvRSabgf7l9l"} className="w-full h-full object-cover opacity-50" alt="Home hero" />
                         <div className="absolute inset-0 flex items-center justify-center">
-                          <label className="cursor-pointer bg-accent text-on-accent p-3 rounded-full font-headline font-bold text-[8px] uppercase tracking-widest shadow-xl hover:scale-110 transition-all flex items-center justify-center">
-                            {uploadingSlot === slot.id ? <div className="w-4 h-4 border-2 border-on-accent border-t-transparent rounded-full animate-spin" /> : <span className="material-symbols-outlined text-sm">cloud_upload</span>}
-                            <input type="file" accept="image/*" className="hidden" onChange={(e) => handleImageUpdate(slot.id, e)} disabled={uploadingSlot === slot.id} />
+                          <label className="cursor-pointer bg-accent text-on-accent px-6 py-3 rounded-full font-headline font-bold text-[10px] uppercase tracking-widest shadow-xl hover:scale-105 transition-all flex items-center gap-2">
+                            {uploadingSlot === 'homeHero' ? <div className="w-4 h-4 border-2 border-on-accent border-t-transparent rounded-full animate-spin" /> : <span className="material-symbols-outlined text-sm">cloud_upload</span>}
+                            Update Home Hero
+                            <input type="file" accept="image/*" className="hidden" onChange={(e) => handleImageUpdate('homeHero', e)} disabled={uploadingSlot === 'homeHero'} />
                           </label>
                         </div>
                       </div>
                     </div>
-                  ))}
+                    <div className="space-y-4">
+                      <label className="font-label text-[10px] tracking-[0.2em] uppercase text-primary-text/40 block">Featured Project Image</label>
+                      <div className="relative group rounded-2xl overflow-hidden aspect-video bg-white/5 border border-white/5">
+                        <img src={settings.homeFeaturedImage || "https://lh3.googleusercontent.com/aida-public/AB6AXuANbIL4n3isYdQZkVxQLQGvTdocx1Z5T8RkPdPW5psdhKjVpSzhMAHb2anWRSlDSAePOYnMs26pC2ttf8YuR5u8pGuGrhv8PDFzlE646PKVe8qHo0zpFERgwuJsu_9NFHNE48cgvnOL_NG4ObsNooVxXpVdOdisR0lkTuCyxIJE5ekJAa5FW_8LP3rlCLH2SOXMNFeSiz0l78KChdMDIsqMzLF1ewlK6D_nav19k5OVOni0yJ9eh7kpXcI5KWlmsXk2fhOK4RIgFJmA"} className="w-full h-full object-cover opacity-50" alt="Featured project" />
+                        <div className="absolute inset-0 flex items-center justify-center">
+                          <label className="cursor-pointer bg-accent text-on-accent px-6 py-3 rounded-full font-headline font-bold text-[10px] uppercase tracking-widest shadow-xl hover:scale-105 transition-all flex items-center gap-2">
+                            {uploadingSlot === 'homeFeaturedImage' ? <div className="w-4 h-4 border-2 border-on-accent border-t-transparent rounded-full animate-spin" /> : <span className="material-symbols-outlined text-sm">cloud_upload</span>}
+                            Update Featured Image
+                            <input type="file" accept="image/*" className="hidden" onChange={(e) => handleImageUpdate('homeFeaturedImage', e)} disabled={uploadingSlot === 'homeFeaturedImage'} />
+                          </label>
+                        </div>
+                      </div>
+                    </div>
+                    <div className="space-y-4 md:col-span-2">
+                      <label className="font-label text-[10px] tracking-[0.2em] uppercase text-primary-text/40 block">Practice House Render</label>
+                      <div className="relative group rounded-2xl overflow-hidden aspect-[2/1] bg-white/5 border border-white/5">
+                        <img src={settings.homeIntroImage || houseRender} className={`w-full h-full object-contain p-4 ${settings.homeIntroImage ? 'opacity-50' : 'opacity-0'}`} alt="Practice house render" />
+                        <div className="absolute inset-0 flex items-center justify-center">
+                          <label className="cursor-pointer bg-accent text-on-accent px-6 py-3 rounded-full font-headline font-bold text-[10px] uppercase tracking-widest shadow-xl hover:scale-105 transition-all flex items-center gap-2">
+                            {uploadingSlot === 'homeIntroImage' ? <div className="w-4 h-4 border-2 border-on-accent border-t-transparent rounded-full animate-spin" /> : <span className="material-symbols-outlined text-sm">cloud_upload</span>}
+                            Update House Render
+                            <input type="file" accept="image/png,image/jpeg,image/webp" className="hidden" onChange={(e) => handleImageUpdate('homeIntroImage', e)} disabled={uploadingSlot === 'homeIntroImage'} />
+                          </label>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Services Page Section */}
+                <div className="bg-card-bg/30 border border-white/5 p-8 rounded-3xl space-y-8">
+                  <div className="flex items-center gap-4">
+                    <span className="material-symbols-outlined text-accent">architecture</span>
+                    <h3 className="font-headline font-bold text-lg uppercase tracking-wider text-primary-text">Services Page</h3>
+                  </div>
+                  <div className="space-y-4">
+                    <label className="font-label text-[10px] tracking-[0.2em] uppercase text-primary-text/40 block">Floating Model Image</label>
+                    <div className="relative group rounded-2xl overflow-hidden aspect-video bg-white/5 border border-white/5">
+                      <img src={settings.servicesModel || "https://lh3.googleusercontent.com/aida-public/AB6AXuAmLJLVr-u5vNVg6-5nELs24TrHcXnBR4dA_jA70oaCkN5povJEHW_iLFR6JvqhpCQZqa74snkvGEuBRyGFGptS7byLjSN4mwLcuaW3ua03qRmdCIrkW_KTZD2xWsEgWtoUVE0avhroUhdgjn_Si49kb1DiWVF6Z6tJ6zzQIpazT4_CTCfQsW4HHOTtWVQduvv1pndQjMFHTjWVWLWGfucRDm3NU7lXFjKPlOGORw-_vs1cqJNCa-YP5fg6Mzm4hI5dhvRvbrkIneHQ"} className="w-full h-full object-contain mix-blend-lighten opacity-50" alt="Services Model" />
+                      <div className="absolute inset-0 flex items-center justify-center">
+                        <label className="cursor-pointer bg-accent text-on-accent px-6 py-3 rounded-full font-headline font-bold text-[10px] uppercase tracking-widest shadow-xl hover:scale-105 transition-all flex items-center gap-2">
+                          {uploadingSlot === 'servicesModel' ? <div className="w-4 h-4 border-2 border-on-accent border-t-transparent rounded-full animate-spin" /> : <span className="material-symbols-outlined text-sm">cloud_upload</span>}
+                          Update Services Model
+                          <input type="file" accept="image/*" className="hidden" onChange={(e) => handleImageUpdate('servicesModel', e)} disabled={uploadingSlot === 'servicesModel'} />
+                        </label>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* About Page Portfolio */}
+                <div className="bg-card-bg/30 border border-white/5 p-8 rounded-3xl space-y-10 lg:col-span-2">
+                  <div className="flex items-center gap-4">
+                    <span className="material-symbols-outlined text-accent">person</span>
+                    <h3 className="font-headline font-bold text-lg uppercase tracking-wider text-primary-text">About Page Assets</h3>
+                  </div>
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-8">
+                    {[
+                      { id: 'aboutPortrait', label: 'Main Portrait', default: "https://lh3.googleusercontent.com/aida-public/AB6AXuDFbeSpEsP4UlxheqYTjaSPhvQyzC42RjwGaNVPdj5E8bP5u9evp0DK1kMT2gg4HjqD74UsnZJuTXOAXZ6BZrvjBNZdqbg6t_-G5A5OC50iqAk25I8u77-4Aq-xvZrN00KYPjogwZKXcKggof0kINXeqZs2k825ZDmlZiqL-tJ93RdxGY1vGyJAp95vnMdDtym1wdK-cmC0xt9J8N-F_boBUEe30vT6Vw9oy85Amm8d_BRVHd5s2Qe8hiksHPkeCHir16qfORTjssEn" },
+                      { id: 'aboutPhilosophy', label: 'Philosophy Detail', default: "https://lh3.googleusercontent.com/aida-public/AB6AXuCJR59X0MEgm3EDXP0vXKABKq6E9IsYS73RpHgcORBrndrCSvo0LCQ5vBpVB8dgALoriBrFEODZFfZ8wGzvyup3oD9_Q18LWirI1ASAznfOEfKfHlu6_FRaxWKxHcK0AH8dJ7aqrpo0L1DjKoCJiGp2TGTe725fjj0Ii6y4mhe3kpM2We-e_B2Od1IP0O8-VfogcAz2gkqWtv2E-Y9R0wPc7g-7W-Dd_5Dect6AQ4ucVe1zl80lm_AewrdkYIGo3ZYAOM82U5T3cnk_" },
+                      { id: 'aboutResilience', label: 'Resilience Abstract', default: "https://lh3.googleusercontent.com/aida-public/AB6AXuBbo_EdStQMs7fOy5oIB3kyfoN38-gC-8VxrG-gzeUTro7_zWf6Za4fa3Et4FM9alG_yq0AFPZnb_ssuDmjXuggHfENKp1gAc7CwpJhwd9m_Fn2y966cbjoUh68JDhgCqlc1Tfnosy0-hMzTJVnpp68LLjtrq9B5JprTsU2yXquRnoGiptQzuiQ4-UwqRdtFEc2SOm_RNn9kzmRKo5pfCCs3UlRd1KD1qLHFT8IOLs1hSa6eYHDWbPfRKdq0ccmOOl_lQAgw772l4iO" }
+                    ].map(slot => (
+                      <div key={slot.id} className="space-y-4">
+                        <label className="font-label text-[10px] tracking-[0.2em] uppercase text-primary-text/40 block">{slot.label}</label>
+                        <div className="relative group rounded-2xl overflow-hidden aspect-[4/5] bg-white/5 border border-white/5">
+                          <img src={settings[slot.id] || slot.default} className="w-full h-full object-cover opacity-50" alt={slot.label} />
+                          <div className="absolute inset-0 flex items-center justify-center">
+                            <label className="cursor-pointer bg-accent text-on-accent p-3 rounded-full font-headline font-bold text-[8px] uppercase tracking-widest shadow-xl hover:scale-110 transition-all flex items-center justify-center">
+                              {uploadingSlot === slot.id ? <div className="w-4 h-4 border-2 border-on-accent border-t-transparent rounded-full animate-spin" /> : <span className="material-symbols-outlined text-sm">cloud_upload</span>}
+                              <input type="file" accept="image/*" className="hidden" onChange={(e) => handleImageUpdate(slot.id, e)} disabled={uploadingSlot === slot.id} />
+                            </label>
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
                 </div>
               </div>
             </div>
-          </div>
-        )}
-
-        {currentTab === 'inquiries' && (
-          <>
-            <div className="flex flex-col md:flex-row justify-between items-start md:items-end gap-6 mb-16">
-              <div>
-                <span className="font-label text-[10px] tracking-[0.3em] uppercase text-accent mb-4 block">Dashboard</span>
-                <h1 className="font-headline font-extrabold text-3xl md:text-6xl tracking-tighter text-primary-text uppercase">Direct <span className="italic font-light">Inquiries</span></h1>
-              </div>
-            </div>
-
-          <div className="bg-card-bg/30 border border-white/5 rounded-2xl overflow-hidden shadow-2xl">
-            <div className="overflow-x-auto">
-              <table className="w-full text-left font-body min-w-[800px] md:min-w-0">
-              <thead className="bg-white/5">
-                <tr>
-                  <th className="p-6 font-label text-[10px] tracking-[0.2em] uppercase text-primary-text/40">Sender</th>
-                  <th className="p-6 font-label text-[10px] tracking-[0.2em] uppercase text-primary-text/40">Email</th>
-                  <th className="p-6 font-label text-[10px] tracking-[0.2em] uppercase text-primary-text/40">Message</th>
-                  <th className="p-6 font-label text-[10px] tracking-[0.2em] uppercase text-primary-text/40 text-right">Date</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-white/5 text-primary-text/80">
-                {contacts.map((row) => (
-                  <tr key={row.id} className="hover:bg-white/5 transition-colors group">
-                    <td className="p-6 font-headline text-xs font-bold uppercase tracking-wider">{row.name}</td>
-                    <td className="p-6 text-sm text-accent/80 hover:text-accent transition-colors"><a href={`mailto:${row.email}`}>{row.email}</a></td>
-                    <td className="p-6 text-sm max-w-sm"><p className="truncate" title={row.message}>{row.message}</p></td>
-                    <td className="p-6 text-right text-sm text-primary-text/50">
-                      {row.createdAt?.seconds ? new Date(row.createdAt.seconds * 1000).toLocaleDateString() : 'N/A'}
-                    </td>
-                  </tr>
-                ))}
-                {contacts.length === 0 && (
-                   <tr>
-                     <td colSpan="4" className="p-8 text-center text-primary-text/40 text-sm">
-                        No inquiries received.
-                     </td>
-                   </tr>
-                )}
-              </tbody>
-            </table>
-          </div>
-        </div>
-          </>
-        )}
+          )}
         </div>
       </section>
     </main>
